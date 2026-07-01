@@ -39,6 +39,9 @@ class FakeMarketData:
     def get_instrument(self, code):
         return {"code": code, "InstrumentStatus": 0}
 
+    def get_market_data_ex(self, **kwargs):
+        return {"params": kwargs, "data": {"600000.SH": {"close": [10.0]}}}
+
 
 class FakePositionProvider:
     def get_positions(self, account_id):
@@ -56,7 +59,7 @@ class FakePositionProvider:
         return AssetSnapshot(account_id=account_id, cash=100.0, total_asset=1000.0)
 
 
-def _service(allow_order_methods=False):
+def _service(allow_order_methods=False, process_in_listener=False):
     redis_client = FakeRedis()
     order_gateway = DryRunOrderGateway()
     handlers = BigQmtRpcHandlers(
@@ -66,7 +69,12 @@ def _service(allow_order_methods=False):
         order_gateway=order_gateway,
         allow_order_methods=allow_order_methods,
     )
-    return redis_client, RedisPubSubRpcService(redis_client, handlers, account_id="acct")
+    return redis_client, RedisPubSubRpcService(
+        redis_client,
+        handlers,
+        account_id="acct",
+        process_in_listener=process_in_listener,
+    )
 
 
 class FakeOrderGateway(DryRunOrderGateway):
@@ -127,6 +135,40 @@ class RedisRpcTest(unittest.TestCase):
         self.assertTrue(response["ok"])
         self.assertEqual(response["data"]["600000.SH"]["available"], 800)
         self.assertEqual(redis_client.published[0][0], "bigqmt:rpc:resp:acct:req-1")
+
+    def test_process_in_listener_handles_request_without_waiting_for_drain(self):
+        redis_client, service = _service(process_in_listener=True)
+
+        service.enqueue_payload(
+            {
+                "request_id": "listener-req",
+                "account_id": "acct",
+                "method": "ping",
+                "params": {},
+            }
+        )
+
+        response = json.loads(redis_client.kv["bigqmt:rpc:resp:acct:listener-req"])
+        self.assertTrue(response["ok"], response["error"])
+        self.assertTrue(response["data"]["pong"])
+        self.assertEqual(service.drain_pending(), 0)
+
+    def test_process_in_listener_leaves_non_listener_methods_queued(self):
+        redis_client, service = _service(process_in_listener=True)
+
+        service.enqueue_payload(
+            {
+                "request_id": "queued-tick",
+                "account_id": "acct",
+                "method": "get_full_tick",
+                "params": {"codes": ["600000.SH"]},
+            }
+        )
+
+        self.assertNotIn("bigqmt:rpc:resp:acct:queued-tick", redis_client.kv)
+        self.assertEqual(service.drain_pending(), 1)
+        response = json.loads(redis_client.kv["bigqmt:rpc:resp:acct:queued-tick"])
+        self.assertTrue(response["ok"], response["error"])
 
     def test_account_mismatch_is_rejected(self):
         redis_client, service = _service()
@@ -322,6 +364,29 @@ class RedisRpcTest(unittest.TestCase):
         self.assertEqual(order_gateway.submitted[0].volume, 100)
         self.assertEqual(order_gateway.submitted[0].remark, "mini")
         self.assertEqual(order_gateway.cancelled[0].order_sys_id, "sys-1")
+
+    def test_market_data_method_is_whitelisted_and_dispatched(self):
+        redis_client, service = _service()
+
+        service.enqueue_payload(
+            {
+                "request_id": "market-data-ex",
+                "account_id": "acct",
+                "method": "get_market_data_ex",
+                "params": {
+                    "field_list": ["close"],
+                    "stock_list": ["600000.SH"],
+                    "period": "1d",
+                    "count": 1,
+                },
+            }
+        )
+        service.drain_pending()
+
+        response = json.loads(redis_client.kv["bigqmt:rpc:resp:acct:market-data-ex"])
+        self.assertTrue(response["ok"], response["error"])
+        self.assertEqual(response["data"]["params"]["field_list"], ["close"])
+        self.assertEqual(response["data"]["data"]["600000.SH"]["close"], [10.0])
 
 
 if __name__ == "__main__":

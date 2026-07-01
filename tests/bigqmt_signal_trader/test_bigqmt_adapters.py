@@ -32,6 +32,47 @@ class FakeContext:
         return {"InstrumentStatus": 0}
 
 
+class FakeMarketDataContext(FakeContext):
+    def __init__(self):
+        super().__init__()
+        self.market_calls = []
+
+    def get_market_data_ex(
+        self,
+        fields=None,
+        stock_code=None,
+        period="1d",
+        start_time="",
+        end_time="",
+        count=-1,
+        dividend_type="none",
+    ):
+        self.market_calls.append(
+            {
+                "method": "get_market_data_ex",
+                "fields": fields,
+                "stock_code": stock_code,
+                "period": period,
+                "start_time": start_time,
+                "end_time": end_time,
+                "count": count,
+                "dividend_type": dividend_type,
+            }
+        )
+        return {"600000.SH": {"close": [10.0]}}
+
+
+class FakeMarketDataFallbackContext(FakeContext):
+    def get_market_data(self, fields=None, stock_code=None, period="1d", **kwargs):
+        return {
+            "method": "get_market_data",
+            "fields": fields,
+            "stock_code": stock_code,
+            "period": period,
+            "kwargs": kwargs,
+        }
+
+
 class BigQmtAdaptersTest(unittest.TestCase):
     def test_market_provider_normalizes_codes_before_context_call(self):
         context = FakeContext()
@@ -52,6 +93,28 @@ class BigQmtAdaptersTest(unittest.TestCase):
         provider.get_ticks(["SH", "sz"])
 
         self.assertEqual(context.tick_codes, [["SH", "SZ"]])
+
+    def test_market_provider_supports_bigqmt_market_data_ex_signature(self):
+        context = FakeMarketDataContext()
+        provider = BigQmtMarketDataProvider(context)
+
+        data = provider.get_market_data_ex(field_list=["close"], stock_list=["600000.SH"], count=1)
+
+        self.assertEqual(data["600000.SH"]["close"], [10.0])
+        self.assertEqual(context.market_calls[0]["fields"], ["close"])
+        self.assertEqual(context.market_calls[0]["stock_code"], ["600000.SH"])
+        self.assertEqual(context.market_calls[0]["count"], 1)
+
+    def test_market_provider_falls_back_to_market_data_when_ex_is_missing(self):
+        context = FakeMarketDataFallbackContext()
+        provider = BigQmtMarketDataProvider(context)
+
+        data = provider.get_market_data_ex(field_list=["close"], stock_list=["600000.SH"], period="1m")
+
+        self.assertEqual(data["method"], "get_market_data")
+        self.assertEqual(data["fields"], ["close"])
+        self.assertEqual(data["stock_code"], ["600000.SH"])
+        self.assertEqual(data["period"], "1m")
 
     def test_position_provider_maps_qmt_position_objects(self):
         calls = []

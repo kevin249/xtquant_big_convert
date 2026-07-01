@@ -38,19 +38,9 @@ from bigqmt_signal_trader.xtquant_compat import (
 )
 from bigqmt_signal_trader import xtquant_compat as xtconstant
 
-configure(
-    account_id="1234567890",
-    redis_config={
-        "host": "192.168.1.100",
-        "port": 63790,
-        "db": 5,
-        "username": "",
-        "password": "******",
-    },
-    timeout_seconds=6,
-)
+configure()
 
-acc = StockAccount("1234567890", "STOCK")
+acc = StockAccount(xt_trader.client.account_id, "STOCK")
 positions = xt_trader.query_stock_positions(acc)
 ticks = xtdata.get_full_tick(["600000.SH"])
 ```
@@ -67,16 +57,33 @@ from xtquant.xttype import StockAccount
 from xtquant import xtdata, xtconstant
 ```
 
-会命中本仓库提供的 `src/xtquant/` shim。这样主业务代码基本不用改，只需要确保启动前设置 Redis 和账号环境变量：
+会命中本仓库提供的 `src/xtquant/` shim。这样主业务代码基本不用改，只需要在本地私有配置文件里设置 Redis 和账号：
+
+```python
+# D:\gjzqqmt\xtquant_big_convert\src\bigqmt_signal_trader_client_config.py
+BIGQMT_ACCOUNT_ID = "YOUR_ACCOUNT_ID"
+BIGQMT_RPC_TIMEOUT_SECONDS = 6.0
+
+BIGQMT_REDIS_CONFIG = {
+    "host": "YOUR_REDIS_HOST",
+    "port": 6379,
+    "db": 5,
+    "username": "",
+    "password": "******",
+}
+
+BIGQMT_FULL_TICK_CACHE_CONFIG = {
+    "enabled": True,
+    "demand_ttl_seconds": 10,
+    "cache_ttl_seconds": 10,
+    "wait_seconds": 3.5,
+}
+```
+
+然后启动前只需要确认本仓库的 `src` 在 `PYTHONPATH` 最前面：
 
 ```powershell
 $env:PYTHONPATH = "D:\gjzqqmt\xtquant_big_convert\src;$env:PYTHONPATH"
-$env:BIGQMT_ACCOUNT_ID = "1234567890"
-$env:BIGQMT_REDIS_HOST = "192.168.1.100"
-$env:BIGQMT_REDIS_PORT = "63790"
-$env:BIGQMT_REDIS_DB = "5"
-$env:BIGQMT_REDIS_USERNAME = ""
-$env:BIGQMT_REDIS_PASSWORD = "******"
 ```
 
 如果同一台机器仍然安装了真实 MiniQMT 的 `xtquant` 包，要确认 `D:\gjzqqmt\xtquant_big_convert\src` 位于 `PYTHONPATH` 最前面，否则 Python 会先加载真实 `xtquant`。
@@ -104,10 +111,25 @@ $env:BIGQMT_REDIS_PASSWORD = "******"
 | `query_stock_trades(acc)` | 已兼容 | 返回对象列表，含 `order_type`、`traded_volume`、`traded_price` |
 | `order_stock()` / `order_stock_async()` | 已兼容 | 需要大 QMT 本地配置打开 `rpc_allow_order_methods=True` |
 | `cancel_order_stock_sysid()` | 已兼容 | 需要大 QMT 本地配置打开 `rpc_allow_order_methods=True` |
-| `xtdata.get_full_tick(codes)` | 已兼容 | 支持单票、ETF、`["SH", "SZ"]` 全市场；返回五档字段 |
+| `xtdata.get_full_tick(codes)` | 已兼容 | 默认读 Redis 快照缓存；客户端 10 秒续约需求，大 QMT 约 3 秒刷新一次；支持单票、ETF、`["SH", "SZ"]` 全市场 |
 | `xtdata.get_instrument_detail(code)` | 已兼容 | 映射到大 QMT `get_instrumentdetail()` |
-| `xtdata.subscribe_whole_quote(codes, callback)` | 基础兼容 | 当前做一次 `get_full_tick` 并调用 callback，不是持续推送 |
-| `xtdata.get_stock_list_in_sector("沪深A股")` | 基础兼容 | 通过 `get_full_tick(["SH","SZ"])` 结果过滤沪深 A 股 |
+| `xtdata.get_instrument_type(code)` | 已接入 | 优先调大 QMT；不支持时按代码前缀做基础判断 |
+| `xtdata.subscribe_quote(...)` / `subscribe_whole_quote(...)` | Redis 订阅兼容 | 写入 `bigqmt:quote_subscriptions:{account_id}`，并向 `bigqmt:quote_events:{account_id}` 发事件；callback 会收到一次当前快照/历史数据 |
+| `xtdata.unsubscribe_quote(seq)` | Redis 事件兼容 | 不强依赖大 QMT 反订阅 API，直接删除 Redis 订阅表并推送 `unsubscribe_quote` 事件 |
+| `xtdata.get_market_data(...)` | 已接入 RPC | 透传到大 QMT `ContextInfo.get_market_data`，返回 DataFrame/字典结构会自动 JSON 化再还原 |
+| `xtdata.get_market_data_ex(...)` | 已接入 RPC | 大 QMT 不支持 `get_market_data_ex` 时回退到 `get_market_data` |
+| `xtdata.get_local_data(...)` | 已接入 RPC | 大 QMT 不支持 `get_local_data` 时回退到 `get_market_data` |
+| `xtdata.get_stock_list_in_sector(...)` | 已接入 RPC | 优先调大 QMT；失败时对 `"沪深A股"` 用 `get_full_tick(["SH","SZ"])` 过滤 |
+| `xtdata.get_sector_list()` / `get_sector_info()` | 已接入 RPC | 依赖大 QMT `ContextInfo` 是否支持 |
+| `xtdata.get_divid_factors(...)` | 已接入 RPC | 依赖大 QMT `ContextInfo` 是否支持 |
+| `xtdata.download_history_data(...)` / `download_history_data2(...)` | 已接入 RPC | 依赖大 QMT `ContextInfo` 是否支持 |
+| `xtdata.get_trading_dates(...)` / `get_holidays()` / `download_holiday_data()` | 已接入 RPC | 依赖大 QMT `ContextInfo` 是否支持 |
+| `xtdata.get_ipo_info(...)` | 已接入 RPC | 行情侧新股资料；交易侧 `query_ipo_data()` 仍是占位 |
+| `xtdata.get_etf_info()` / `download_etf_info()` | 已接入 RPC | 依赖大 QMT `ContextInfo` 是否支持 |
+| `xtdata.get_option_list(...)` / 历史期权列表 | 已接入 RPC | 依赖大 QMT `ContextInfo` 是否支持 |
+| `xtdata.get_financial_data(...)` / `download_financial_data(...)` | 已接入 RPC | 支持 DataFrame 返回值序列化 |
+| `xtdata.call_formula(...)` / `subscribe_formula(...)` / `unsubscribe_formula(...)` / `get_formula_result(...)` | 已接入 RPC | 对应截图里的模型调用/订阅能力，依赖大 QMT `ContextInfo` 是否支持 |
+| `xtdata.gen_factor_index(...)` | 已接入 RPC | 对应生成因子数据，依赖大 QMT `ContextInfo` 是否支持 |
 | `query_ipo_data()` / `query_new_purchase_limit()` | 占位兼容 | 当前返回空结果，打新需要后续补大 QMT 等价能力 |
 
 ## 下单开关
@@ -116,8 +138,8 @@ $env:BIGQMT_REDIS_PASSWORD = "******"
 
 ```python
 BIGQMT_REDIS_CONFIG = {
-    "host": "192.168.1.100",
-    "port": 63790,
+    "host": "YOUR_REDIS_HOST",
+    "port": 6379,
     "db": 5,
     "username": "",
     "password": "******",
@@ -134,19 +156,9 @@ BIGQMT_REDIS_CONFIG = {
 ```python
 from bigqmt_signal_trader.xtquant_compat import StockAccount, configure, xt_trader, xtdata
 
-configure(
-    account_id="1234567890",
-    redis_config={
-        "host": "192.168.1.100",
-        "port": 63790,
-        "db": 5,
-        "username": "",
-        "password": "******",
-    },
-    timeout_seconds=8,
-)
+configure()
 
-acc = StockAccount("1234567890", "STOCK")
+acc = StockAccount(xt_trader.client.account_id, "STOCK")
 
 asset = xt_trader.query_stock_asset(acc)
 positions = xt_trader.query_stock_positions(acc)
@@ -169,7 +181,7 @@ from xtquant.xttype import StockAccount
 from xtquant import xtdata, xtconstant
 
 trader = XtQuantTrader("", 12345)
-acc = StockAccount("1234567890", "STOCK")
+acc = StockAccount(trader.client.account_id, "STOCK")
 
 assert trader.connect() == 0
 assert trader.subscribe(acc) == 0
@@ -191,17 +203,9 @@ python -B -m unittest discover -s tests\bigqmt_signal_trader
 ```python
 from bigqmt_signal_trader.xtquant_compat import StockAccount, configure, xt_trader, xtdata
 
-configure(
-    account_id="1234567890",
-    redis_config={
-        "host": "192.168.1.100",
-        "port": 63790,
-        "db": 5,
-        "password": "******",
-    },
-)
+configure()
 
-acc = StockAccount("1234567890")
+acc = StockAccount(xt_trader.client.account_id)
 print(xt_trader.query_stock_asset(acc))
 print(xt_trader.query_stock_positions(acc)[:3])
 print(xtdata.get_full_tick(["600000.SH"]))
@@ -209,7 +213,10 @@ print(xtdata.get_full_tick(["600000.SH"]))
 
 ## 注意事项
 
-- `subscribe_whole_quote()` 当前是基础兼容：立即查询一次并调用 callback，不是持续推送。
-- `get_stock_list_in_sector("沪深A股")` 当前通过 `get_full_tick(["SH", "SZ"])` 过滤 A 股，速度取决于大 QMT 全市场快照返回耗时。
+- `subscribe_quote()` / `subscribe_whole_quote()` 当前通过 Redis 记录订阅意图，并给 callback 推一次当前数据；持续行情推送需要独立的 Redis 行情生产者消费 `bigqmt:quote_subscriptions:{account_id}`。
+- `get_full_tick()` 默认不走 RPC 现拉；第一次没有快照时会短等一轮大 QMT 刷新，仍没有新快照则超时，避免返回过期行情。
+- `unsubscribe_quote(seq)` 当前按你的要求直接写 Redis：删除订阅表并推送 `unsubscribe_quote` 事件，不等待大 QMT 确认。
+- `get_stock_list_in_sector("沪深A股")` 的本地兜底会通过 `get_full_tick(["SH", "SZ"])` 过滤 A 股，速度取决于大 QMT 全市场快照返回耗时。
+- 历史行情、财务、ETF、期权、模型/因子等接口已经接到 RPC，但实际是否可用取决于大 QMT 策略环境里的 `ContextInfo` 是否暴露同名方法。
 - `query_ipo_data()` / `query_new_purchase_limit()` 当前返回空结果，打新逻辑不能直接视为无损替换。
 - RPC 下单默认关闭；打开前必须确认大 QMT 页面正在运行正确账号的 RPC 策略。

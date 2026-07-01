@@ -7,6 +7,7 @@ by ``drain_pending``.
 
 import datetime as _dt
 import json
+import math
 import queue
 import threading
 import time
@@ -22,6 +23,35 @@ READ_METHODS = {
     "ping",
     "get_ticks",
     "get_instrument",
+    "get_instrument_type",
+    "get_market_data",
+    "get_market_data_ex",
+    "get_local_data",
+    "get_stock_list_in_sector",
+    "get_sector_list",
+    "get_sector_info",
+    "get_markets",
+    "get_market_last_trade_date",
+    "get_divid_factors",
+    "download_history_data",
+    "download_history_data2",
+    "get_trading_dates",
+    "get_holidays",
+    "download_holiday_data",
+    "get_ipo_info",
+    "get_etf_info",
+    "download_etf_info",
+    "get_option_list",
+    "get_his_option_list",
+    "get_his_option_list_batch",
+    "get_financial_data",
+    "download_financial_data",
+    "download_financial_data2",
+    "call_formula",
+    "subscribe_formula",
+    "unsubscribe_formula",
+    "get_formula_result",
+    "gen_factor_index",
     "get_positions",
     "get_asset",
     "query_orders",
@@ -39,6 +69,7 @@ METHOD_ALIASES = {
     "get_full_tick": "get_ticks",
     "get_instrument_detail": "get_instrument",
     "get_instrumentdetail": "get_instrument",
+    "getDividFactors": "get_divid_factors",
     "query_stock_asset": "get_asset",
     "query_stock_positions": "get_positions",
     "query_stock_orders": "query_orders",
@@ -52,13 +83,85 @@ METHOD_ALIASES = {
 BUY_ORDER_TYPES = {"23", "STOCK_BUY", "BUY", "B"}
 SELL_ORDER_TYPES = {"24", "STOCK_SELL", "SELL", "S"}
 CANCELABLE_ORDER_STATUSES = {"50", "55"}
+MARKET_DATA_METHODS = {
+    "get_instrument_type",
+    "get_market_data",
+    "get_market_data_ex",
+    "get_local_data",
+    "get_stock_list_in_sector",
+    "get_sector_list",
+    "get_sector_info",
+    "get_markets",
+    "get_market_last_trade_date",
+    "get_divid_factors",
+    "download_history_data",
+    "download_history_data2",
+    "get_trading_dates",
+    "get_holidays",
+    "download_holiday_data",
+    "get_ipo_info",
+    "get_etf_info",
+    "download_etf_info",
+    "get_option_list",
+    "get_his_option_list",
+    "get_his_option_list_batch",
+    "get_financial_data",
+    "download_financial_data",
+    "download_financial_data2",
+    "call_formula",
+    "subscribe_formula",
+    "unsubscribe_formula",
+    "get_formula_result",
+    "gen_factor_index",
+}
+
+
+def _maybe_scalar(value):
+    item = getattr(value, "item", None)
+    if callable(item):
+        try:
+            return item()
+        except Exception:
+            return value
+    return value
 
 
 def to_jsonable(value):
+    value = _maybe_scalar(value)
     if value is None or isinstance(value, (str, int, float, bool)):
+        if isinstance(value, float) and (math.isnan(value) or math.isinf(value)):
+            return None
         return value
-    if isinstance(value, _dt.datetime):
+    if isinstance(value, (_dt.datetime, _dt.date)):
         return value.strftime("%Y-%m-%d %H:%M:%S")
+    if hasattr(value, "isoformat") and value.__class__.__module__.startswith("pandas"):
+        try:
+            return value.isoformat()
+        except Exception:
+            return str(value)
+    if hasattr(value, "to_dict") and hasattr(value, "columns") and hasattr(value, "index"):
+        try:
+            frame = value.reset_index()
+            return {
+                "__bigqmt_type__": "DataFrame",
+                "columns": [str(col) for col in frame.columns],
+                "records": to_jsonable(frame.to_dict("records")),
+            }
+        except Exception:
+            return str(value)
+    if hasattr(value, "to_dict") and hasattr(value, "index") and not isinstance(value, dict):
+        try:
+            return {
+                "__bigqmt_type__": "Series",
+                "data": to_jsonable(value.to_dict()),
+            }
+        except Exception:
+            return str(value)
+    if hasattr(value, "tolist") and not isinstance(value, (str, bytes, bytearray)):
+        try:
+            return to_jsonable(value.tolist())
+        except Exception:
+            pass
     if isinstance(value, dict):
         return {str(key): to_jsonable(item) for key, item in value.items()}
     if isinstance(value, (list, tuple, set)):
@@ -126,7 +229,9 @@ class BigQmtRpcHandlers:
         if method in ORDER_METHODS and not self.allow_order_methods:
             raise PermissionError("order rpc methods are disabled")
         handler = getattr(self, "_handle_%s" % method, None)
-        if handler is None:
+        if handler is None and method in MARKET_DATA_METHODS:
+            return self._handle_market_data_method(method, params)
+        elif handler is None:
             raise ValueError("rpc method is not implemented: %s" % requested_method)
         return handler(params)
 
@@ -153,6 +258,12 @@ class BigQmtRpcHandlers:
         if not code:
             raise ValueError("code is required")
         return self.market_data.get_instrument(code)
+
+    def _handle_market_data_method(self, method, params):
+        handler = getattr(self.market_data, method, None)
+        if handler is None:
+            raise NotImplementedError("market data method is not available: %s" % method)
+        return handler(**dict(params or {}))
 
     def _handle_get_positions(self, params):
         return self.position_provider.get_positions(self._request_account_id(params))
@@ -270,6 +381,8 @@ class RedisPubSubRpcService:
         response_key_template="bigqmt:rpc:resp:{account_id}:{request_id}",
         response_ttl_seconds=60,
         max_queue_size=200,
+        process_in_listener=False,
+        listener_methods=None,
         print_prefix="[bigqmt_rpc]",
     ):
         self.redis = redis_client
@@ -279,6 +392,10 @@ class RedisPubSubRpcService:
         self.response_channel_template = response_channel_template
         self.response_key_template = response_key_template
         self.response_ttl_seconds = int(response_ttl_seconds)
+        self.process_in_listener = bool(process_in_listener)
+        if listener_methods is None:
+            listener_methods = ("ping",)
+        self.listener_methods = set(str(name) for name in listener_methods)
         self.print_prefix = print_prefix
         self.pending = queue.Queue(maxsize=int(max_queue_size))
         self._running = threading.Event()
@@ -334,6 +451,10 @@ class RedisPubSubRpcService:
 
     def enqueue_payload(self, raw_payload):
         payload = self._loads(raw_payload)
+        method = str(payload.get("method") or "")
+        if self.process_in_listener and method in self.listener_methods:
+            self.process_request(payload)
+            return
         self.pending.put_nowait(payload)
 
     def _loads(self, raw_payload):

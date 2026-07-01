@@ -47,6 +47,18 @@ class FakeHistoryContext(FakeContext):
         return False
 
 
+class FakeRpcService:
+    def __init__(self):
+        self.drained = []
+
+    def drain_pending(self, max_items=20):
+        self.drained.append(max_items)
+        return 0
+
+    def stop(self):
+        pass
+
+
 class BigQmtStrategyRunnerTest(unittest.TestCase):
     def setUp(self):
         self.app = FakeApp()
@@ -71,6 +83,16 @@ class BigQmtStrategyRunnerTest(unittest.TestCase):
 
         self.assertEqual(context.accounts, ["test-account"])
 
+    def test_init_detects_bigqmt_account_from_runtime_global(self):
+        context = FakeContext()
+        strategy_module.account = "runtime-account"
+        try:
+            strategy_module.init(context)
+        finally:
+            delattr(strategy_module, "account")
+
+        self.assertEqual(context.accounts, ["runtime-account"])
+
     def test_adjust_forwards_to_app_tick(self):
         strategy_module.init(FakeContext())
         strategy_module.adjust(FakeContext())
@@ -90,6 +112,15 @@ class BigQmtStrategyRunnerTest(unittest.TestCase):
 
         strategy_module.adjust(FakeHistoryContext())
 
+        self.assertEqual(self.app.ticks, [])
+
+    def test_adjust_drains_rpc_even_when_not_last_bar(self):
+        rpc_service = FakeRpcService()
+        strategy_module._rpc_service = rpc_service
+
+        strategy_module.adjust(FakeHistoryContext())
+
+        self.assertEqual(rpc_service.drained, [20])
         self.assertEqual(self.app.ticks, [])
 
     def test_order_and_trade_callbacks_forward_to_app(self):

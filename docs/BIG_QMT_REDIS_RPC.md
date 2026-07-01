@@ -9,6 +9,13 @@
 - `ping`
 - `get_ticks`
 - `get_instrument`
+- `get_market_data` / `get_market_data_ex` / `get_local_data`
+- `get_stock_list_in_sector` / `get_sector_list` / `get_sector_info`
+- `get_divid_factors` / `download_history_data` / `download_history_data2`
+- `get_trading_dates` / `get_holidays` / `download_holiday_data`
+- `get_ipo_info` / `get_etf_info` / `get_option_list`
+- `get_financial_data` / `download_financial_data`
+- `call_formula` / `subscribe_formula` / `unsubscribe_formula` / `get_formula_result` / `gen_factor_index`
 - `get_positions`
 - `get_asset`
 - `query_orders`
@@ -28,7 +35,7 @@ RPC 服务端会把以下 MiniQMT 常用方法名映射到大 QMT 适配器：
 | `query_stock_position` | `query_stock_position` | 查询单只持仓，按 `stock_code` 过滤 |
 | `query_stock_orders` | `query_orders` | 查询委托；支持 `cancelable_only` 过滤 |
 | `query_stock_trades` | `query_trades` | 查询成交 |
-| `get_full_tick` | `get_ticks` | 查询实时 tick |
+| `get_full_tick` | `get_ticks` | RPC 白名单仍保留；MiniQMT 兼容层默认改为 Redis 快照缓存读取 |
 | `get_instrument_detail` / `get_instrumentdetail` | `get_instrument` | 查询合约详情 |
 | `order_stock` / `order_stock_async` | `submit_order` | 买卖下单；默认关闭 |
 | `cancel_order_stock` / `cancel_order_stock_sysid` | `cancel_order` | 撤单；默认关闭 |
@@ -38,6 +45,8 @@ RPC 服务端会把以下 MiniQMT 常用方法名映射到大 QMT 适配器：
 `price_type` 会透传到大 QMT `passorder()`，常用值包括 `11/FIX_PRICE`、`5/LATEST_PRICE`、`44/MARKET_PEER_PRICE_FIRST`、`43/MARKET_SH_CONVERT_5_LIMIT`、`47/MARKET_SZ_CONVERT_5_CANCEL`。
 
 `get_full_tick/get_ticks` 的 `codes` 参数支持两种写法：传合约代码如 `["600000.SH", "000001.SZ"]` 查询指定标的；传市场代码如 `["SH", "SZ"]` 查询全市场全推快照。
+
+注意：兼容层的 `xtdata.get_full_tick(codes)` 默认不再通过 RPC 现拉全市场行情。客户端会把需求写入 Redis，10 秒内持续续约；大 QMT 在 `adjust` 中刷新活跃需求到 Redis 快照：**个股列表需求**按 `full_tick_refresh_interval_seconds`(默认 0.5s)快刷，**市场代码需求**(`SH/SZ/BJ/HK` 全市场)按 `full_tick_market_refresh_interval_seconds`(默认 3s)慢刷，避免每个快 tick 都传 5 万条数据；客户端只读取新鲜快照。个股列表若首次缓存未命中，会回退一次 live RPC(~ms)避免硬等；市场代码未命中则只抛超时、不 live 拉全市场。
 
 ## 实现文件
 
@@ -83,6 +92,11 @@ BIGQMT_REDIS_CONFIG = {
     "username": "",
     "password": "...",
     "rpc_allow_order_methods": False,
+    "full_tick_cache_enabled": True,
+    "full_tick_demand_ttl_seconds": 10,
+    "full_tick_cache_ttl_seconds": 10,
+    "full_tick_refresh_interval_seconds": 3,
+    "full_tick_max_requests": 8,
 }
 ```
 
@@ -153,6 +167,8 @@ deal_callback = _runtime.deal_callback
 
 ## Redis 协议
 
+### RPC 请求/响应
+
 请求 channel：
 
 ```text
@@ -197,6 +213,34 @@ bigqmt:rpc:resp:{account_id}:{request_id}
 }
 ```
 
+### get_full_tick 需求驱动缓存
+
+客户端调用 `xtdata.get_full_tick(codes)` 时会写入需求：
+
+```text
+bigqmt:full_tick:demand:{account_id}
+```
+
+其中 hash field 是规范化代码集合的 request id，value 包含：
+
+```json
+{
+  "request_id": "...",
+  "codes": ["SH", "SZ"],
+  "requested_at_ts": 1780000000.0,
+  "expires_at_ts": 1780000010.0,
+  "cache_ttl_seconds": 10
+}
+```
+
+大 QMT 每轮刷新后写入快照：
+
+```text
+bigqmt:full_tick:cache:{account_id}:{request_id}
+```
+
+快照 Redis key 的 TTL 默认是 10 秒；客户端还会校验 `updated_at_ts`，超过 `cache_ttl_seconds` 的快照不会返回。第一次调用如果还没有快照，客户端默认最多等待 `3.5s` 等下一轮大 QMT 刷新；**个股列表**仍然没有新快照时回退一次 live RPC(`get_full_tick`)以避免冷启动硬停；**市场代码**(`SH/SZ/BJ/HK`)则抛出超时、不回退 live 拉全市场。
+
 ## 外部调用示例
 
 ```python
@@ -225,6 +269,16 @@ response = call_redis_rpc(
 
 print(response)
 ```
+
+## 延迟与轮询节奏
+
+读 RPC 的主要延迟来源不是 Redis 传输，而是**服务端的队列排空节奏**：订阅线程只把请求塞进 `pending` 队列，真正调用 QMT 的 `drain_pending` 只在 `adjust/handlebar` 里跑，而 `adjust` 由 `run_time("adjust", schedule_adjust_interval)` 触发。因此除 `ping` 外的每个方法，最多要等一个 `schedule_adjust_interval` 才被执行。
+
+- `schedule_adjust_interval`：默认 `"500nMilliSecond"`，可在 `BIGQMT_REDIS_CONFIG` 里调（如 `"1000nMilliSecond"`/`"200nMilliSecond"`）。降低它按比例减少队列等待。
+- **务必在真机验证 `run_time` 真按该间隔触发**：启动后每 ~10 秒会打印一行 `adjust cadence: ticks=.. avg=.. min=.. max=..`，看 `avg` 是否贴近你设的间隔。若被 QMT 静默钳制（例如仍是 ~1s/3s），说明该间隔未生效，延迟不会下降。
+- 若 `run_time` 不可用或注册失败，会打印 `WARNING ... falls back to bar cadence`，此时排空退化到 bar 回调节奏（可能到分钟级），需要排查。
+
+提高 `adjust` 频率会增加策略线程负担（`tick_app`、full_tick 刷新也在其中），并可能挤占 order/trade 回调——上线后一并观察回调延迟。
 
 ## 安全约束
 

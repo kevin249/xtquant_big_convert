@@ -27,6 +27,22 @@ REDIS_DB = 5
 REDIS_USERNAME = ""
 REDIS_PASSWORD = ""
 RPC_ALLOW_ORDER_METHODS = False
+RPC_PROCESS_IN_LISTENER = True
+RPC_LISTENER_METHODS = ("ping",)
+# How often the strategy thread drains the RPC queue (via adjust). Lower = less
+# queue wait for read RPCs. Verify on the live box that run_time honors sub-3s
+# intervals (see the adjust cadence log) before trusting a low value.
+SCHEDULE_ADJUST_INTERVAL = "500nMilliSecond"
+FULL_TICK_CACHE_ENABLED = True
+FULL_TICK_DEMAND_TTL_SECONDS = 10
+FULL_TICK_CACHE_TTL_SECONDS = 10
+# Symbol-list demands refresh fast; whole-market (SH/SZ/BJ/HK) demands refresh on
+# a slower cadence so a ~50k row snapshot is not pulled on every fast tick.
+FULL_TICK_REFRESH_INTERVAL_SECONDS = 0.5
+FULL_TICK_MARKET_REFRESH_INTERVAL_SECONDS = 3.0
+# Wall-clock budget for one refresh round to avoid stalling the strategy thread.
+FULL_TICK_REFRESH_MAX_WALL_SECONDS = 0.3
+FULL_TICK_MAX_REQUESTS = 8
 
 try:
     from bigqmt_signal_trader_local_config import BIGQMT_ACCOUNT_ID, BIGQMT_REDIS_CONFIG
@@ -41,6 +57,28 @@ REDIS_DB = int(BIGQMT_REDIS_CONFIG.get("db", REDIS_DB))
 REDIS_USERNAME = BIGQMT_REDIS_CONFIG.get("username", REDIS_USERNAME)
 REDIS_PASSWORD = BIGQMT_REDIS_CONFIG.get("password", REDIS_PASSWORD)
 RPC_ALLOW_ORDER_METHODS = bool(BIGQMT_REDIS_CONFIG.get("rpc_allow_order_methods", RPC_ALLOW_ORDER_METHODS))
+RPC_PROCESS_IN_LISTENER = bool(
+    BIGQMT_REDIS_CONFIG.get("rpc_process_in_listener", RPC_PROCESS_IN_LISTENER and not RPC_ALLOW_ORDER_METHODS)
+)
+RPC_LISTENER_METHODS = tuple(BIGQMT_REDIS_CONFIG.get("rpc_listener_methods", RPC_LISTENER_METHODS))
+SCHEDULE_ADJUST_INTERVAL = str(BIGQMT_REDIS_CONFIG.get("schedule_adjust_interval", SCHEDULE_ADJUST_INTERVAL))
+FULL_TICK_CACHE_ENABLED = bool(BIGQMT_REDIS_CONFIG.get("full_tick_cache_enabled", FULL_TICK_CACHE_ENABLED))
+FULL_TICK_DEMAND_TTL_SECONDS = float(
+    BIGQMT_REDIS_CONFIG.get("full_tick_demand_ttl_seconds", FULL_TICK_DEMAND_TTL_SECONDS)
+)
+FULL_TICK_CACHE_TTL_SECONDS = float(
+    BIGQMT_REDIS_CONFIG.get("full_tick_cache_ttl_seconds", FULL_TICK_CACHE_TTL_SECONDS)
+)
+FULL_TICK_REFRESH_INTERVAL_SECONDS = float(
+    BIGQMT_REDIS_CONFIG.get("full_tick_refresh_interval_seconds", FULL_TICK_REFRESH_INTERVAL_SECONDS)
+)
+FULL_TICK_MARKET_REFRESH_INTERVAL_SECONDS = float(
+    BIGQMT_REDIS_CONFIG.get("full_tick_market_refresh_interval_seconds", FULL_TICK_MARKET_REFRESH_INTERVAL_SECONDS)
+)
+FULL_TICK_REFRESH_MAX_WALL_SECONDS = float(
+    BIGQMT_REDIS_CONFIG.get("full_tick_refresh_max_wall_seconds", FULL_TICK_REFRESH_MAX_WALL_SECONDS)
+)
+FULL_TICK_MAX_REQUESTS = int(BIGQMT_REDIS_CONFIG.get("full_tick_max_requests", FULL_TICK_MAX_REQUESTS))
 
 
 def _apply_config(account_id):
@@ -53,7 +91,7 @@ def _apply_config(account_id):
         position_sync_type="redis",
         enable_rpc=True,
         schedule_adjust=True,
-        schedule_adjust_interval="3000nMilliSecond",
+        schedule_adjust_interval=SCHEDULE_ADJUST_INTERVAL,
         redis={
             "host": REDIS_HOST,
             "port": REDIS_PORT,
@@ -72,6 +110,18 @@ def _apply_config(account_id):
             "response_key_template": "bigqmt:rpc:resp:{account_id}:{request_id}",
             "response_ttl_seconds": 60,
             "drain_max_items": 20,
+            "process_in_listener": RPC_PROCESS_IN_LISTENER,
+            "listener_methods": RPC_LISTENER_METHODS,
+        },
+        full_tick_cache={
+            "enabled": FULL_TICK_CACHE_ENABLED,
+            "account_id": account_id,
+            "demand_ttl_seconds": FULL_TICK_DEMAND_TTL_SECONDS,
+            "cache_ttl_seconds": FULL_TICK_CACHE_TTL_SECONDS,
+            "refresh_interval_seconds": FULL_TICK_REFRESH_INTERVAL_SECONDS,
+            "market_refresh_interval_seconds": FULL_TICK_MARKET_REFRESH_INTERVAL_SECONDS,
+            "refresh_max_wall_seconds": FULL_TICK_REFRESH_MAX_WALL_SECONDS,
+            "max_requests": FULL_TICK_MAX_REQUESTS,
         },
     )
 
@@ -81,7 +131,7 @@ def configure_runtime_account(account_id):
 
 
 def configure_runtime_redis(redis_config):
-    global REDIS_HOST, REDIS_PORT, REDIS_DB, REDIS_USERNAME, REDIS_PASSWORD, RPC_ALLOW_ORDER_METHODS
+    global REDIS_HOST, REDIS_PORT, REDIS_DB, REDIS_USERNAME, REDIS_PASSWORD, RPC_ALLOW_ORDER_METHODS, RPC_PROCESS_IN_LISTENER, RPC_LISTENER_METHODS, SCHEDULE_ADJUST_INTERVAL, FULL_TICK_CACHE_ENABLED, FULL_TICK_DEMAND_TTL_SECONDS, FULL_TICK_CACHE_TTL_SECONDS, FULL_TICK_REFRESH_INTERVAL_SECONDS, FULL_TICK_MARKET_REFRESH_INTERVAL_SECONDS, FULL_TICK_REFRESH_MAX_WALL_SECONDS, FULL_TICK_MAX_REQUESTS
     redis_config = dict(redis_config or {})
     REDIS_HOST = redis_config.get("host", REDIS_HOST)
     REDIS_PORT = int(redis_config.get("port", REDIS_PORT))
@@ -89,6 +139,26 @@ def configure_runtime_redis(redis_config):
     REDIS_USERNAME = redis_config.get("username", REDIS_USERNAME)
     REDIS_PASSWORD = redis_config.get("password", REDIS_PASSWORD)
     RPC_ALLOW_ORDER_METHODS = bool(redis_config.get("rpc_allow_order_methods", RPC_ALLOW_ORDER_METHODS))
+    RPC_PROCESS_IN_LISTENER = bool(
+        redis_config.get("rpc_process_in_listener", RPC_PROCESS_IN_LISTENER and not RPC_ALLOW_ORDER_METHODS)
+    )
+    RPC_LISTENER_METHODS = tuple(redis_config.get("rpc_listener_methods", RPC_LISTENER_METHODS))
+    SCHEDULE_ADJUST_INTERVAL = str(redis_config.get("schedule_adjust_interval", SCHEDULE_ADJUST_INTERVAL))
+    FULL_TICK_CACHE_ENABLED = bool(redis_config.get("full_tick_cache_enabled", FULL_TICK_CACHE_ENABLED))
+    FULL_TICK_DEMAND_TTL_SECONDS = float(
+        redis_config.get("full_tick_demand_ttl_seconds", FULL_TICK_DEMAND_TTL_SECONDS)
+    )
+    FULL_TICK_CACHE_TTL_SECONDS = float(redis_config.get("full_tick_cache_ttl_seconds", FULL_TICK_CACHE_TTL_SECONDS))
+    FULL_TICK_REFRESH_INTERVAL_SECONDS = float(
+        redis_config.get("full_tick_refresh_interval_seconds", FULL_TICK_REFRESH_INTERVAL_SECONDS)
+    )
+    FULL_TICK_MARKET_REFRESH_INTERVAL_SECONDS = float(
+        redis_config.get("full_tick_market_refresh_interval_seconds", FULL_TICK_MARKET_REFRESH_INTERVAL_SECONDS)
+    )
+    FULL_TICK_REFRESH_MAX_WALL_SECONDS = float(
+        redis_config.get("full_tick_refresh_max_wall_seconds", FULL_TICK_REFRESH_MAX_WALL_SECONDS)
+    )
+    FULL_TICK_MAX_REQUESTS = int(redis_config.get("full_tick_max_requests", FULL_TICK_MAX_REQUESTS))
     _apply_config(ACCOUNT_ID)
 
 

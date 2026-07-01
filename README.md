@@ -6,9 +6,12 @@
 
 - 在大 QMT 策略进程中启动 Redis Pub/Sub RPC 服务。
 - 查询资产、持仓、委托、成交、tick 和合约详情。
+- 透传行情/历史/财务/ETF/期权/模型/因子等 xtdata 风格接口到大 QMT `ContextInfo`。
 - 兼容 `query_stock_asset`、`query_stock_positions`、`query_stock_orders`、`query_stock_trades`、`get_full_tick`、`order_stock` 等 MiniQMT 常用方法名。
+- `get_full_tick` 默认走 Redis 需求驱动快照：客户端 10 秒内续约需求，大 QMT 约 3 秒刷新一次，客户端读取 Redis 而不是每次 RPC 现拉。
 - 提供 `bigqmt_signal_trader.xtquant_compat` 客户端兼容层，可把原来的 `xt_trader` / `xtdata` 调用转成 Redis RPC。
 - 提供可选 `src/xtquant/` shim，可让旧代码的 `from xtquant import xtdata, xtconstant` 命中本仓库兼容实现。
+- 行情订阅/反订阅状态写入 Redis：`bigqmt:quote_subscriptions:{account_id}` 和 `bigqmt:quote_events:{account_id}`。
 - 默认只读，`order_stock` / `cancel_order_stock_sysid` 等下单撤单接口默认关闭。
 - 提供 dry-run 信号消费、Redis 状态写回和持仓同步骨架。
 
@@ -33,15 +36,23 @@
 
 ```python
 # <QMT_PYTHON_DIR>\bigqmt_signal_trader_local_config.py
-BIGQMT_ACCOUNT_ID = "1234567890"
+BIGQMT_ACCOUNT_ID = "YOUR_ACCOUNT_ID"
 
 BIGQMT_REDIS_CONFIG = {
-    "host": "192.168.1.100",
-    "port": 63790,
+    "host": "YOUR_REDIS_HOST",
+    "port": 6379,
     "db": 5,
     "username": "",
     "password": "******",
     "rpc_allow_order_methods": False,
+    # 读 RPC 排空节奏（主要延迟来源），越小延迟越低；真机需确认 run_time 真按此间隔触发。
+    "schedule_adjust_interval": "500nMilliSecond",
+    "full_tick_cache_enabled": True,
+    "full_tick_demand_ttl_seconds": 10,
+    "full_tick_cache_ttl_seconds": 10,
+    "full_tick_refresh_interval_seconds": 0.5,
+    "full_tick_market_refresh_interval_seconds": 3,
+    "full_tick_refresh_max_wall_seconds": 0.3,
 }
 ```
 
@@ -54,18 +65,9 @@ BIGQMT_REDIS_CONFIG = {
 ```python
 from bigqmt_signal_trader.xtquant_compat import StockAccount, configure, xt_trader, xtdata
 
-configure(
-    account_id="1234567890",
-    redis_config={
-        "host": "192.168.1.100",
-        "port": 63790,
-        "db": 5,
-        "username": "",
-        "password": "******",
-    },
-)
+configure()
 
-acc = StockAccount("1234567890", "STOCK")
+acc = StockAccount(xt_trader.client.account_id, "STOCK")
 asset = xt_trader.query_stock_asset(acc)
 positions = xt_trader.query_stock_positions(acc)
 ticks = xtdata.get_full_tick(["600000.SH"])
@@ -73,15 +75,35 @@ ticks = xtdata.get_full_tick(["600000.SH"])
 
 ### 3. 最终无损替换
 
-最终切换时，把本仓库 `src` 放到 `PYTHONPATH` 最前面：
+最终切换时，先准备客户端私有配置，再把本仓库 `src` 放到 `PYTHONPATH` 最前面：
+
+先在客户端本地创建私有配置文件：
+
+```python
+# D:\gjzqqmt\xtquant_big_convert\src\bigqmt_signal_trader_client_config.py
+BIGQMT_ACCOUNT_ID = "YOUR_ACCOUNT_ID"
+BIGQMT_RPC_TIMEOUT_SECONDS = 6.0
+
+BIGQMT_REDIS_CONFIG = {
+    "host": "YOUR_REDIS_HOST",
+    "port": 6379,
+    "db": 5,
+    "username": "",
+    "password": "******",
+}
+
+BIGQMT_FULL_TICK_CACHE_CONFIG = {
+    "enabled": True,
+    "demand_ttl_seconds": 10,
+    "cache_ttl_seconds": 10,
+    "wait_seconds": 3.5,
+}
+```
+
+真实配置文件不要提交。最终切换时，只需要把本仓库 `src` 放到 `PYTHONPATH` 最前面：
 
 ```powershell
 $env:PYTHONPATH = "D:\gjzqqmt\xtquant_big_convert\src;$env:PYTHONPATH"
-$env:BIGQMT_ACCOUNT_ID = "1234567890"
-$env:BIGQMT_REDIS_HOST = "192.168.1.100"
-$env:BIGQMT_REDIS_PORT = "63790"
-$env:BIGQMT_REDIS_DB = "5"
-$env:BIGQMT_REDIS_PASSWORD = "******"
 ```
 
 这样旧代码里的下面这些 import 可以保持不变：
@@ -94,13 +116,25 @@ from xtquant import xtdata, xtconstant
 
 完整替换说明见 [docs/XTQUANT_COMPAT_REPLACEMENT.md](docs/XTQUANT_COMPAT_REPLACEMENT.md)。
 
+## 为什么不直接连大 QMT 目录
+
+官方 `xtquant.xttrader.XtQuantTrader` 仍然依赖客户端侧的 XtQuantServer/xtquant 通道。当前国金大 QMT 环境中，直接把大 QMT 安装根目录、`userdata`、账户目录或 `XtTradeData` 传给 `XtQuantTrader`，实测 `connect()` 返回 `-1`；大 QMT 监听的 `58600` 端口是 FormulaServer，不是 `xtdata` 行情服务端口，直接对它调用 `get_full_tick` 会返回“未找到处理函数”。
+
+因此本仓库默认不走“外部 Python 直连大 QMT 目录”的模式，而是把真实接口调用放在大 QMT 内部策略进程中执行：
+
+- 大 QMT 内部运行 `bigqmt_signal_trader_redis_rpc_runtime.py`。
+- 内部策略使用 `passorder`、`get_trade_detail_data`、`ContextInfo` 行情/调度能力。
+- 外部旧系统继续使用 MiniQMT 风格的 `xt_trader` / `xtdata` API，由本仓库兼容层转换为 Redis RPC 或 Redis 行情快照读取。
+
+如果后续券商环境明确开通 XtQuantServer 权限，并且 `XtQuantTrader(...).connect() == 0`，可以再增加直连模式；当前生产默认路径仍是“大 QMT 内部策略 + Redis/RPC”。
+
 ## 本地测试
 
 ```powershell
 python -B -m unittest discover -s tests\bigqmt_signal_trader
 ```
 
-当前测试覆盖 47 个用例。
+当前测试覆盖 66 个用例。
 
 ## QMT 本地配置
 
