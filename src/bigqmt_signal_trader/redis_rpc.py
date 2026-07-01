@@ -478,11 +478,14 @@ class RedisPubSubRpcService:
 
     def start(self):
         self._running.set()
-        # Delegate thread lifecycle to the transport. The transport calls the
-        # registered on_raw_payload hook (set in __init__) for each inbound
-        # message, which routes through _handle_received_payload → enqueue_payload.
+        # Delegate thread lifecycle to the transport. The transport invokes the
+        # on_request callback with a decoded request dict; enqueue_payload routes
+        # it through the inline-vs-deferred fork and publishes the response
+        # itself (returns None so the transport's deliver() does not double-send).
+        # RedisTransport additionally routes raw bytes through on_raw_payload
+        # (set in __init__) for its own receive loops.
         self._transport.start_receiving(
-            self._handle_received_payload,
+            self.enqueue_payload,
             background_threads=self.background_threads,
         )
         # Mirror transport threads onto the service for stop()/diagnostics.
