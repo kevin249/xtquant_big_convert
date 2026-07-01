@@ -12,6 +12,7 @@
 - `get_full_tick` 默认直接 RPC 调用；仍保留 Redis 需求驱动快照缓存作为全市场行情的可选降载模式。
 - 提供 `bigqmt_signal_trader.xtquant_compat` 客户端兼容层，可把原来的 `xt_trader` / `xtdata` 调用转成 Redis RPC。
 - 提供可选 `src/xtquant/` shim，可让旧代码的 `from xtquant import xtdata, xtconstant` 命中本仓库兼容实现。
+- **可插拔 RPC 传输层**：除默认 Redis 外，支持 ZMQ（同机低延迟）、MySQL（兼容兜底）、SHM（接口预留），切换只需改一个 `transport` 配置字段，业务代码零改动。ZMQ 带端口冲突自动避让 + Redis 服务发现。
 - 行情订阅/反订阅状态写入 Redis：`bigqmt:quote_subscriptions:{account_id}` 和 `bigqmt:quote_events:{account_id}`。
 - 默认只读，`order_stock` / `cancel_order_stock_sysid` 等下单撤单接口默认关闭。
 - 提供 dry-run 信号消费、Redis 状态写回和持仓同步骨架。
@@ -19,13 +20,16 @@
 ## 目录
 
 - `src/bigqmt_signal_trader/`：核心包和适配器。
+- `src/bigqmt_signal_trader/transports/`：可插拔 RPC 传输层（redis/zmq/mysql/shm）。
 - `src/bigqmt_signal_trader/xtquant_compat.py`：MiniQMT 风格客户端兼容层。
 - `src/xtquant/`：可选的 `xtquant` import shim。
 - `src/bigqmt_signal_trader_strategy.py`：大 QMT 策略基础入口。
 - `src/bigqmt_signal_trader_redis_rpc_runtime.py`：只启用 Redis RPC 的大 QMT 入口。
 - `src/bigqmt_signal_trader_redis_dryrun.py`：Redis 信号 dry-run 入口。
+- `src/BIGQMT_REDIS_DRYRUN.py`：大 QMT 编辑器加载入口（GBK 编码，自动 reload + 绑定 passorder/cancel/get_trade_detail_data）。
 - `tests/bigqmt_signal_trader/`：无 QMT 环境也能运行的单元测试。
 - `docs/`：运行说明和 RPC 协议。
+- `bench_latency.py` / `bench_transports.py`：延迟基准脚本。
 
 ## 快速用法
 
@@ -61,6 +65,23 @@ BIGQMT_REDIS_CONFIG = {
 ```
 
 然后在大 QMT 策略编辑器里运行 `bigqmt_signal_trader_redis_rpc_runtime.py` 对应入口。详细入口脚本见 [docs/BIG_QMT_REDIS_RPC.md](docs/BIG_QMT_REDIS_RPC.md)。
+
+#### 切换传输层（可选）
+
+默认走 Redis。要切到 ZMQ（同机低延迟，约快 60 倍）或 MySQL（兼容兜底），加 `transport` 字段：
+
+```python
+BIGQMT_REDIS_CONFIG = {
+    "transport": "zmq",          # 默认 "redis"。可选: redis/zmq/mysql/shm
+    # zmq 默认从 account_id 派生端口，端口冲突时自动找空闲端口并通过 Redis 服务发现
+    # 客户端配同样的 transport + 同 account_id 即可自动对齐，无需手动指定端口
+    "zmq": {"host": "127.0.0.1"},   # 跨机改成实际 IP
+    # 其余 redis 配置保留（ZMQ 服务发现仍用这个 Redis）
+    # ...
+}
+```
+
+客户端配置同样加 `transport` 字段。完整传输层说明见 [docs/RPC_TRANSPORTS.md](docs/RPC_TRANSPORTS.md)。
 
 ### 2. 原策略侧灰度接入
 
@@ -138,9 +159,11 @@ from xtquant import xtdata, xtconstant
 python -B -m unittest discover -s tests\bigqmt_signal_trader
 ```
 
-当前测试覆盖 68 个用例。
+当前测试覆盖 77 个用例（含传输层往返测试）。
 
 ## 当前实测延迟
+
+### Redis（生产默认路径）
 
 大 QMT 端使用 Redis queue + `run_time("adjust", "500nMilliSecond")` drain。最近一次真机测试结果：
 
@@ -152,7 +175,17 @@ python -B -m unittest discover -s tests\bigqmt_signal_trader
 | `get_full_tick(["000001.SZ"])` | 20/20 | 24.9ms | 13.6ms | 14.8ms | 239.4ms |
 | `get_full_tick` 三只票 | 10/10 | 37.5ms | 17.2ms | 18.4ms | 225.2ms |
 
-常态请求多在 12-18ms；偶发 200ms+ 主要来自 500ms 调度边界。队列测试后无残留，QMT 日志无新增 DataError/Traceback。
+### 传输层对比（同机 n=100）
+
+切换传输层可用 `bench_transports.py -n 100` 复现：
+
+| 传输 | P50 | P90 | P99 | 适用场景 |
+|---|---:|---:|---:|---|
+| Redis（真实服务器） | 12.2ms | 14.8ms | 290ms | 默认，跨机也能用 |
+| **ZMQ**（tcp 回环） | **0.21ms** | **0.33ms** | 20.6ms | 同机低延迟，主优化 |
+| MySQL（pymysql+连接池） | ~150ms | ~195ms | ~360ms | 兼容兜底 |
+
+ZMQ 同机路径比 Redis 快约 60 倍（p50）。Redis 偶发 200ms+ 尖峰来自网络/调度抖动，非周期性。完整说明见 [docs/RPC_TRANSPORTS.md](docs/RPC_TRANSPORTS.md)。
 
 ## QMT 本地配置
 
