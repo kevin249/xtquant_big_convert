@@ -89,6 +89,10 @@ class ZmqTransport(RpcTransport):
         recv_timeout_seconds=1.0,
         server_hwm=10000,
         client_linger_ms=0,
+        discovery_redis_client=None,
+        discovery_key_template="bigqmt:zmq:addr:{account_id}",
+        discovery_ttl_seconds=300,
+        port_scan_range=50,
     ):
         super(ZmqTransport, self).__init__(account_id=account_id, print_prefix=print_prefix)
         # Address resolution order: explicit bind_address/connect_address win;
@@ -102,16 +106,27 @@ class ZmqTransport(RpcTransport):
         default_addr = "tcp://%s:%d" % (resolved_host, resolved_port)
         self.bind_address = bind_address or default_addr
         self.connect_address = connect_address
+        self.bind_host = resolved_host
+        self.base_port = resolved_port
         self.io_threads = int(io_threads)
         self.recv_timeout_seconds = float(recv_timeout_seconds)
         self.server_hwm = int(server_hwm)
         self.client_linger_ms = int(client_linger_ms)
+        # Service discovery: when the derived port is taken, the server scans
+        # upward for a free port and publishes the real address to Redis so the
+        # client can find it. Without a discovery client this falls back to the
+        # static derived address (and bind conflicts surface as errors).
+        self.discovery_redis_client = discovery_redis_client
+        self.discovery_key_template = discovery_key_template
+        self.discovery_ttl_seconds = int(discovery_ttl_seconds)
+        self.port_scan_range = int(port_scan_range)
 
         self._zmq = None  # imported lazily
         self._ctx = None
         # server state
         self._router = None
         self._router_thread = None
+        self._actual_bind_address = None  # set after start_receiving()
         self._pending_identities = {}  # request_id -> client identity bytes
         self._identity_lock = threading.Lock()
         # client state
@@ -133,6 +148,12 @@ class ZmqTransport(RpcTransport):
             recv_timeout_seconds=float(config.get("recv_timeout_seconds", 1.0)),
             server_hwm=int(config.get("server_hwm", 10000)),
             client_linger_ms=int(config.get("client_linger_ms", 0)),
+            discovery_redis_client=config.get("discovery_redis_client"),
+            discovery_key_template=config.get(
+                "discovery_key_template", "bigqmt:zmq:addr:{account_id}"
+            ),
+            discovery_ttl_seconds=int(config.get("discovery_ttl_seconds", 300)),
+            port_scan_range=int(config.get("port_scan_range", 50)),
         )
 
     # -- shared zmq context -----------------------------------------------
@@ -150,18 +171,81 @@ class ZmqTransport(RpcTransport):
         return self._zmq, self._ctx
 
     # -- server side ------------------------------------------------------
+    def _bind_with_fallback(self):
+        """Bind the ROUTER socket, scanning ports if the default is taken.
+
+        Tries ``self.bind_address`` first. On ZMQ EADDRINUSE, walks upward
+        from the base port for up to ``port_scan_range`` ports. The actually
+        bound address is recorded on ``self._actual_bind_address`` and, when a
+        discovery client is configured, published to Redis so clients can find
+        it. Re-raises the original error if no port in the range is free.
+        """
+        zmq, ctx = self._ensure_zmq()
+        attempts = [self.bind_address]
+        # Build fallback ports from the base port upward. We always scan so a
+        # collision (e.g. a stale server on the derived port) is recovered
+        # automatically; an explicit bind_address just sets the scan origin.
+        try:
+            base = int(self.bind_address.rsplit(":", 1)[1])
+            host_part = self.bind_address.rsplit(":", 1)[0]
+            for offset in range(1, self.port_scan_range + 1):
+                attempts.append("%s:%d" % (host_part, base + offset))
+        except (ValueError, IndexError):
+            pass
+
+        last_error = None
+        for addr in attempts:
+            sock = ctx.socket(zmq.ROUTER)
+            sock.setsockopt(zmq.RCVHWM, self.server_hwm)
+            sock.setsockopt(zmq.SNDHWM, self.server_hwm)
+            sock.setsockopt(zmq.RCVTIMEO, int(self.recv_timeout_seconds * 1000))
+            try:
+                sock.bind(addr)
+                self._router = sock
+                self._actual_bind_address = addr
+                self._publish_discovery(addr)
+                return
+            except self._zmq.ZMQError as exc:
+                last_error = exc
+                try:
+                    sock.close(linger=0)
+                except Exception:
+                    pass
+                # Only EADDRINUSE is retriable; other errors (e.g. bad host) abort.
+                if getattr(exc, "errno", None) != zmq.EADDRINUSE:
+                    raise
+        # Exhausted the scan range.
+        raise last_error
+
+    def _publish_discovery(self, address):
+        if self.discovery_redis_client is None:
+            return
+        key = self.discovery_key_template.format(account_id=self.account_id)
+        try:
+            self.discovery_redis_client.setex(
+                key, self.discovery_ttl_seconds, address
+            )
+        except Exception as exc:
+            print("%s zmq discovery publish failed: %s" % (self.print_prefix, exc))
+
+    def _clear_discovery(self):
+        if self.discovery_redis_client is None:
+            return
+        key = self.discovery_key_template.format(account_id=self.account_id)
+        try:
+            self.discovery_redis_client.delete(key)
+        except Exception:
+            pass
+
     def start_receiving(self, on_request, background_threads=True):
         super(ZmqTransport, self).start_receiving(on_request)
         zmq, ctx = self._ensure_zmq()
-        self._router = ctx.socket(zmq.ROUTER)
-        self._router.setsockopt(zmq.RCVHWM, self.server_hwm)
-        self._router.setsockopt(zmq.SNDHWM, self.server_hwm)
-        self._router.setsockopt(zmq.RCVTIMEO, int(self.recv_timeout_seconds * 1000))
-        self._router.bind(self.bind_address)
+        self._bind_with_fallback()
+        bound = self._actual_bind_address or self.bind_address
         if not background_threads:
             print(
                 "%s zmq bound=%s background_threads=False"
-                % (self.print_prefix, self.bind_address)
+                % (self.print_prefix, bound)
             )
             return
         self._router_thread = threading.Thread(
@@ -236,12 +320,40 @@ class ZmqTransport(RpcTransport):
             print("%s zmq send failed: %s" % (self.print_prefix, exc))
 
     # -- client side ------------------------------------------------------
+    def _resolve_connect_address(self):
+        """Resolve the address to connect to.
+
+        Order: explicit connect_address > discovery lookup > default derived.
+        Discovery lets the client find a server that had to move off the
+        default port because of a collision.
+        """
+        if self.connect_address:
+            return self.connect_address
+        discovered = self._lookup_discovery()
+        if discovered:
+            return discovered
+        return _default_zmq_address(self.account_id)
+
+    def _lookup_discovery(self):
+        if self.discovery_redis_client is None:
+            return None
+        key = self.discovery_key_template.format(account_id=self.account_id)
+        try:
+            raw = self.discovery_redis_client.get(key)
+        except Exception:
+            return None
+        if not raw:
+            return None
+        try:
+            text = raw.decode("utf-8") if isinstance(raw, (bytes, bytearray)) else str(raw)
+        except Exception:
+            return None
+        return text or None
+
     def _ensure_dealer(self):
         zmq, ctx = self._ensure_zmq()
         if self._dealer is None:
-            # connect_address may be None if the client was built with only an
-            # account_id; fall back to the default tcp address derived from it.
-            address = self.connect_address or _default_zmq_address(self.account_id)
+            address = self._resolve_connect_address()
             sock = ctx.socket(zmq.DEALER)
             # Unique identity so ROUTER can route replies back to us.
             sock.setsockopt(zmq.IDENTITY, uuid.uuid4().hex.encode("utf-8")[:16])
@@ -287,6 +399,11 @@ class ZmqTransport(RpcTransport):
         if self._router_thread is not None and self._router_thread.is_alive():
             self._router_thread.join(2.0)
         self._router_thread = None
+        # If we were a server that published a discovery address, clear it so
+        # clients don't keep hitting a dead endpoint.
+        if self._actual_bind_address is not None:
+            self._clear_discovery()
+            self._actual_bind_address = None
         with self._client_lock:
             if self._dealer is not None:
                 try:

@@ -82,8 +82,25 @@ def _build_redis(config, account_id, print_prefix):
 def _build_zmq(config, account_id, print_prefix):
     from .zmq_transport import ZmqTransport
 
+    zmq_config = dict(config.get("zmq") or {})
+    # Wire up service discovery: if the caller injected a redis_client (server
+    # side) or provided redis connection settings, the ZMQ transport can
+    # publish/look up the actual bound port when the default port is taken.
+    discovery_client = zmq_config.get("discovery_redis_client")
+    if discovery_client is None and config.get("redis_client") is not None:
+        discovery_client = config.get("redis_client")
+        zmq_config["discovery_redis_client"] = discovery_client
+    if discovery_client is None and config.get("redis"):
+        # Build a small client just for discovery from the redis config block.
+        try:
+            from ..adapters.redis_common import build_redis_client
+
+            discovery_client = build_redis_client(dict(config.get("redis") or {}))
+            zmq_config["discovery_redis_client"] = discovery_client
+        except Exception:
+            pass
     return ZmqTransport.from_config(
-        config.get("zmq") or {},
+        zmq_config,
         account_id=account_id,
         print_prefix=print_prefix,
     )

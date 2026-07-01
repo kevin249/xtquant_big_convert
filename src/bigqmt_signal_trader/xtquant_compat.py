@@ -347,8 +347,13 @@ class BigQmtRpcClient:
 
             client_config = load_client_config()
             config_redis = dict(client_config.get("redis_config") or {})
+            zmq_config = dict(config_redis.get("zmq") or {})
+            # Give the ZMQ transport a discovery client so it can find a server
+            # that moved off the default port. Reuse this client's redis
+            # connection (already used for the legacy fallback path).
+            zmq_config.setdefault("discovery_redis_client", self._redis())
             factory_config = {
-                "zmq": config_redis.get("zmq") or {},
+                "zmq": zmq_config,
                 "mysql": config_redis.get("mysql") or {},
             }
             self._transport_instance = build_transport(
