@@ -415,6 +415,7 @@ class RedisPubSubRpcService:
         queue_poll_interval_seconds=0.02,
         debug_log_limit=0,
         print_prefix="[bigqmt_rpc]",
+        transport=None,
     ):
         self.listen_redis = redis_client
         self.redis = response_redis_client or redis_client
@@ -442,6 +443,30 @@ class RedisPubSubRpcService:
         self._thread = None
         self._queue_thread = None
         self._pubsub = None
+        # Transport owns the wire. Default to a RedisTransport built from the
+        # same clients/templates so behavior is unchanged. An explicit
+        # ``transport`` (e.g. ZmqTransport) overrides the Redis path entirely.
+        if transport is None:
+            from .transports.redis_transport import RedisTransport
+
+            transport = RedisTransport(
+                redis_client,
+                account_id=self.account_id,
+                response_redis_client=response_redis_client,
+                request_channel_template=request_channel_template,
+                request_queue_template=request_queue_template,
+                response_channel_template=response_channel_template,
+                response_list_template=response_list_template,
+                response_key_template=response_key_template,
+                response_ttl_seconds=response_ttl_seconds,
+                queue_poll_interval_seconds=queue_poll_interval_seconds,
+                debug_log_limit=debug_log_limit,
+                print_prefix=print_prefix,
+            )
+        self._transport = transport
+        # Route inbound raw payloads through the service's dispatch (which
+        # applies the inline-vs-deferred fork) instead of transport.deliver().
+        self._transport.on_raw_payload = self._handle_received_payload
 
     @property
     def request_channel(self):
@@ -452,40 +477,32 @@ class RedisPubSubRpcService:
         return self.request_queue_template.format(account_id=self.account_id)
 
     def start(self):
+        self._running.set()
+        # Delegate thread lifecycle to the transport. The transport calls the
+        # registered on_raw_payload hook (set in __init__) for each inbound
+        # message, which routes through _handle_received_payload → enqueue_payload.
+        self._transport.start_receiving(
+            self._handle_received_payload,
+            background_threads=self.background_threads,
+        )
+        # Mirror transport threads onto the service for stop()/diagnostics.
+        self._thread = getattr(self._transport, "_thread", None)
+        self._queue_thread = getattr(self._transport, "_queue_thread", None)
         if not self.background_threads:
             print("%s started queue=%s background_threads=False" % (self.print_prefix, self.request_queue))
             return
-        if (
-            self._running.is_set()
-            and self._thread is not None
-            and self._thread.is_alive()
-            and self._queue_thread is not None
-            and self._queue_thread.is_alive()
-        ):
-            return
-        self._running.set()
-        self._thread = threading.Thread(target=self._listen_loop, name="bigqmt-redis-rpc", daemon=True)
-        self._queue_thread = threading.Thread(target=self._queue_loop, name="bigqmt-redis-rpc-queue", daemon=True)
-        self._thread.start()
-        self._queue_thread.start()
         print("%s started channel=%s queue=%s" % (self.print_prefix, self.request_channel, self.request_queue))
 
     def stop(self):
         self._running.clear()
-        pubsub = self._pubsub
-        if pubsub is not None:
-            try:
-                pubsub.close()
-            except Exception:
-                pass
-        thread = self._thread
-        if thread is not None and thread.is_alive():
-            thread.join(1.0)
-        queue_thread = self._queue_thread
-        if queue_thread is not None and queue_thread.is_alive():
-            queue_thread.join(1.0)
+        try:
+            self._transport.stop()
+        except Exception:
+            pass
+        # The transport owns the threads now; keep the attributes for back-compat.
         self._thread = None
         self._queue_thread = None
+        self._pubsub = None
 
     def _listen_loop(self):
         while self._running.is_set():
@@ -519,13 +536,18 @@ class RedisPubSubRpcService:
                 if self.debug_log_limit > 0:
                     print("%s queue polling key=%s" % (self.print_prefix, self.request_queue))
                 while self._running.is_set():
-                    item = self.listen_redis.lpop(self.request_queue)
+                    # brpop blocks server-side until an item arrives (or the
+                    # short timeout fires), so a request is picked up within
+                    # ~1ms of being pushed instead of waiting up to
+                    # queue_poll_interval_seconds. The 1s ceiling lets us
+                    # re-check _running for a clean shutdown.
+                    item = self.listen_redis.brpop(self.request_queue, timeout=1)
                     if not self._running.is_set():
                         break
                     if not item:
-                        time.sleep(self.queue_poll_interval_seconds)
                         continue
-                    self._handle_received_payload(item, "queue")
+                    raw = item[1] if isinstance(item, (list, tuple)) and len(item) >= 2 else item
+                    self._handle_received_payload(raw, "queue")
             except Exception:
                 print("%s queue listener failed:\n%s" % (self.print_prefix, traceback.format_exc()))
                 time.sleep(1.0)
@@ -596,6 +618,12 @@ class RedisPubSubRpcService:
         return processed
 
     def drain_request_queue(self, max_items=20):
+        # Delegate to the transport when it owns the wire directly; for Redis
+        # the transport's drain drives _handle_received_payload (which honors
+        # the inline-vs-deferred fork), matching the original semantics.
+        transport_drain = getattr(self._transport, "drain_request_queue", None)
+        if transport_drain is not None and not isinstance(self._transport, type(None)):
+            return transport_drain(max_items=max_items)
         processed = 0
         for _ in range(int(max_items)):
             item = self.listen_redis.lpop(self.request_queue)
@@ -639,23 +667,10 @@ class RedisPubSubRpcService:
         return template.format(account_id=account_id, request_id=request_id)
 
     def _publish_response(self, request, response):
-        request_id = response["request_id"]
-        account_id = response["account_id"] or self.account_id
-        payload = json.dumps(response, ensure_ascii=False)
-        ttl_seconds = int(request.get("ttl_seconds") or self.response_ttl_seconds)
-        response_key = request.get("reply_key") or self._format_response_target(
-            self.response_key_template, account_id, request_id
-        )
-        response_channel = request.get("reply_channel") or self._format_response_target(
-            self.response_channel_template, account_id, request_id
-        )
-        response_list = request.get("reply_list")
-        if response_key:
-            self._write_response_key(response_key, ttl_seconds, payload)
-        if response_list:
-            self._push_response_list(response_list, ttl_seconds, payload)
-        if response_channel:
-            self._publish_response_channel(response_channel, payload)
+        # Delegate to the transport (RedisTransport fans out to key/list/channel;
+        # ZMQ/MySQL transports use their native reply path).
+        self._transport.send_response(request, response)
+        self._published_count = getattr(self._transport, "_published_count", self._published_count)
 
     def _response_clients(self):
         clients = [self.redis]

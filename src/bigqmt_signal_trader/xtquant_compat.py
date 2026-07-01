@@ -257,6 +257,7 @@ class BigQmtRpcClient:
         redis_client=None,
         redis_config=None,
         timeout_seconds=None,
+        transport=None,
     ):
         client_config = load_client_config()
         config_redis = dict(client_config.get("redis_config") or {})
@@ -313,6 +314,17 @@ class BigQmtRpcClient:
                 or _env_float("BIGQMT_FULL_TICK_POLL_INTERVAL_SECONDS", 0.2)
             ),
         }
+        # Transport selection. Default "redis" keeps the legacy call_redis_rpc
+        # path (so existing client configs are unchanged). Setting transport to
+        # "zmq"/"mysql"/"shm" (via config or constructor) routes calls through
+        # the swappable transport layer instead.
+        self.transport_name = str(
+            transport
+            or merged_redis_config.get("transport")
+            or os.environ.get("BIGQMT_RPC_TRANSPORT")
+            or "redis"
+        ).lower()
+        self._transport_instance = None  # lazily built by _transport()
 
     def _redis(self):
         if self.redis_client is None:
@@ -326,17 +338,53 @@ class BigQmtRpcClient:
             self.redis_client = redis.Redis(**cfg)
         return self.redis_client
 
+    def _transport(self):
+        if self._transport_instance is None:
+            if self.transport_name in ("redis", "", "default"):
+                # Legacy path: call_redis_rpc builds its own request envelope.
+                return None
+            from .transports.factory import build_transport
+
+            client_config = load_client_config()
+            config_redis = dict(client_config.get("redis_config") or {})
+            factory_config = {
+                "zmq": config_redis.get("zmq") or {},
+                "mysql": config_redis.get("mysql") or {},
+            }
+            self._transport_instance = build_transport(
+                self.transport_name,
+                factory_config,
+                account_id=self.account_id,
+                print_prefix="[bigqmt_client]",
+            )
+        return self._transport_instance
+
     def call(self, method, params=None, account_id=None, timeout_seconds=None):
         target_account = str(account_id or self.account_id or "")
         if not target_account:
             raise ValueError("Big QMT account_id is required")
-        response = call_redis_rpc(
-            self._redis(),
-            account_id=target_account,
-            method=method,
-            params=params or {},
-            timeout_seconds=self.timeout_seconds if timeout_seconds is None else timeout_seconds,
-        )
+        wait_seconds = self.timeout_seconds if timeout_seconds is None else timeout_seconds
+        transport = self._transport()
+        if transport is not None:
+            # Swappable transport path (zmq/mysql/...). Build the request
+            # envelope the same way call_redis_rpc does.
+            request = {
+                "schema_version": 1,
+                "request_id": __import__("uuid").uuid.uuid4().hex,
+                "account_id": target_account,
+                "method": method,
+                "params": params or {},
+                "ttl_seconds": 60,
+            }
+            response = transport.send_request(request, wait_seconds)
+        else:
+            response = call_redis_rpc(
+                self._redis(),
+                account_id=target_account,
+                method=method,
+                params=params or {},
+                timeout_seconds=wait_seconds,
+            )
         if not response.get("ok"):
             raise RuntimeError(response.get("error") or "Big QMT RPC failed: %s" % method)
         return _restore_jsonable(response.get("data"))

@@ -202,9 +202,21 @@ def _build_rpc_service(context_info, app, config):
     process_in_listener = _config_bool(rpc_config.get("process_in_listener"), True)
     listener_methods = rpc_config.get("listener_methods") or ("*",)
     background_threads = _config_bool(rpc_config.get("background_threads"), False)
+    transport_name = str(rpc_config.get("transport") or "redis").lower()
+    # Build the transport. Redis is the default and reuses the existing clients/
+    # templates (zero behavior change). zmq/mysql/shm go through the factory and
+    # bypass the Redis clients entirely.
+    transport = None
+    if transport_name not in ("redis", "", "default"):
+        from bigqmt_signal_trader.transports.factory import build_transport
+
+        factory_config = dict(rpc_config)
+        factory_config["account_id"] = account_id
+        factory_config["print_prefix"] = "[bigqmt_rpc]"
+        transport = build_transport(transport_name, factory_config, account_id=account_id, print_prefix="[bigqmt_rpc]")
     print(
-        "[bigqmt_rpc] mode process_in_listener=%s listener_methods=%s allow_order_methods=%s background_threads=%s"
-        % (process_in_listener, listener_methods, allow_order_methods, background_threads)
+        "[bigqmt_rpc] transport=%s mode process_in_listener=%s listener_methods=%s allow_order_methods=%s background_threads=%s"
+        % (transport_name, process_in_listener, listener_methods, allow_order_methods, background_threads)
     )
     return RedisPubSubRpcService(
         redis_client=redis_client,
@@ -220,6 +232,7 @@ def _build_rpc_service(context_info, app, config):
         listener_methods=listener_methods,
         background_threads=background_threads,
         debug_log_limit=int(rpc_config.get("debug_log_limit", 5)),
+        transport=transport,
     )
 
 
