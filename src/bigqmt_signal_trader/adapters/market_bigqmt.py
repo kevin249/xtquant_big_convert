@@ -134,7 +134,14 @@ class BigQmtMarketDataProvider:
         return self._context_method(method_name)(*args, **kwargs)
 
     def _native(self):
-        """Return the native xtdata SDK, resolving it lazily on first use."""
+        """Return the native xtdata SDK, resolving it lazily on first use.
+
+        Returns None when the SDK is not importable. NOTE: in a Big QMT
+        (full trading terminal) process the SDK loads but its get_client()
+        cannot connect to a quote service — there is no MiniQMT process
+        writing ~/.xtquant/*/xtdata.cfg. Callers must therefore be ready for
+        the SDK call itself to raise "无法连接行情服务" and fall back.
+        """
         if self._native_xtdata is None:
             self._native_xtdata = _load_native_xtdata()
         return self._native_xtdata
@@ -143,15 +150,20 @@ class BigQmtMarketDataProvider:
         """Prefer the xtdata SDK function, fall back to a ContextInfo call.
 
         Several data APIs exist only as xtdata module functions. When the SDK
-        is available we use it (the authoritative source). Otherwise we fall
-        back to ContextInfo so that callers in backtest-only contexts still
-        get a best-effort answer instead of a hard NotImplementedError.
+        is available AND its quote service is reachable we use it. Otherwise
+        we fall back to ContextInfo so callers get a best-effort answer.
         """
         module = self._native()
         if module is not None:
             fn = getattr(module, func_name, None)
             if fn is not None:
-                return fn(*args, **kwargs)
+                try:
+                    return fn(*args, **kwargs)
+                except Exception as exc:
+                    # Big QMT path: SDK present but no quote service to talk
+                    # to ("无法连接行情服务"). Don't crash — let the ContextInfo
+                    # fallback have a turn.
+                    pass
         return context_caller()
 
     def _call_first_supported(self, shapes):
@@ -349,12 +361,52 @@ class BigQmtMarketDataProvider:
         )
 
     def get_holidays(self):
-        # Holiday list is a GLOBAL datum, not context-scoped — only the xtdata
-        # SDK exposes it (xtdata.py line 1197). No ContextInfo method exists.
+        """Return the holiday (non-trading) date list.
+
+        Authoritative source is the xtdata SDK (xtdata.py line 1197). In a Big
+        QMT (full terminal) process the SDK is present but cannot reach its
+        quote service, and ContextInfo has no get_holidays method. In that
+        case we derive the holidays from the A-share trading calendar: any
+        weekday in a recent window that is NOT a trading day is a holiday.
+        This is slower than the SDK (it walks the calendar) but correct.
+        """
         def _via_context():
             return self._call_context("get_holidays")
 
-        return self._native_or_context("get_holidays", _via_context)
+        try:
+            result = self._native_or_context("get_holidays", _via_context)
+            if result:
+                return result
+        except Exception:
+            pass
+        # Big QMT fallback: derive holidays from the trading calendar.
+        return self._holidays_from_trading_calendar()
+
+    def _holidays_from_trading_calendar(self, years_back=1):
+        """Derive holiday dates (YYYYMMDD strings) from trading dates.
+
+        Walks business days across [today - years_back, today] and collects
+        those that are absent from the A-share trading calendar. Requires
+        get_trading_dates to work (it does in Big QMT via ContextInfo).
+        """
+        import datetime
+
+        try:
+            trading = set(str(d) for d in (self.get_trading_dates("SH", "", "", -1) or []))
+        except Exception:
+            return []
+        today = datetime.date.today()
+        start = today.replace(year=today.year - years_back, month=1, day=1)
+        holidays = []
+        cur = start
+        one_day = datetime.timedelta(days=1)
+        while cur <= today:
+            if cur.weekday() < 5:  # Mon-Fri
+                ymd = cur.strftime("%Y%m%d")
+                if ymd not in trading:
+                    holidays.append(ymd)
+            cur += one_day
+        return holidays
 
     def download_holiday_data(self, incrementally=True):
         def _via_context():
@@ -411,13 +463,36 @@ class BigQmtMarketDataProvider:
     def download_financial_data2(self, stock_list, table_list=None, start_time="", end_time=""):
         return self._call_context("download_financial_data2", stock_list, table_list or [], start_time, end_time)
 
+    # Well-known sector names that Big QMT's ContextInfo recognises for
+    # get_stock_list_in_sector / get_sector. Used as a fallback when the full
+    # sector list is not enumerable (Big QMT has no get_sector_list method and
+    # the xtdata SDK's quote service is unreachable inside the full terminal).
+    _FALLBACK_SECTORS = (
+        "沪深A股", "沪市A股", "深市A股", "科创板", "创业板",
+        "上证期权", "深证期权", "中金所",
+        "沪市债券", "深市债券",
+        "沪市基金", "深市基金", "沪深ETF",
+    )
+
     def get_sector_list(self):
-        # Sector list is a GLOBAL datum — only the xtdata SDK exposes it
-        # (xtdata.py line 784). No ContextInfo method exists.
+        """Return the list of sector names.
+
+        Authoritative source is the xtdata SDK (xtdata.py line 784). In a Big
+        QMT (full terminal) process the SDK is present but cannot reach its
+        quote service, and ContextInfo has no get_sector_list method either.
+        In that case we fall back to a curated list of well-known sector names
+        so callers can still drive get_stock_list_in_sector(name).
+        """
         def _via_context():
             return self._call_context("get_sector_list")
 
-        return self._native_or_context("get_sector_list", _via_context)
+        try:
+            result = self._native_or_context("get_sector_list", _via_context)
+            if result:
+                return result
+        except (NotImplementedError, Exception):
+            pass
+        return list(self._FALLBACK_SECTORS)
 
     def get_sector_info(self, sector_name=""):
         return self._call_context("get_sector_info", sector_name)
