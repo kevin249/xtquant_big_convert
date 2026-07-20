@@ -146,6 +146,28 @@ def _clear_local_modules():
         sys.modules.pop(name, None)
 
 
+def _stop_previous_rpc_service():
+    """Release the previous QMT strategy's socket before clearing its module.
+
+    QMT can re-execute this entry in the same Python process.  The old strategy
+    module owns the RPC service and its ZMQ ROUTER socket, so dropping that
+    module from ``sys.modules`` first would make the service unreachable and
+    leave its port bound for the next strategy start.
+    """
+    previous = sys.modules.get("bigqmt_signal_trader_strategy")
+    reset = getattr(previous, "reset_app", None)
+    if not callable(reset):
+        return
+    try:
+        reset()
+        print("[bigqmt_shell] previous rpc service stopped")
+    except Exception as exc:
+        # Continue the reload so a broken old instance does not prevent QMT
+        # from reporting its normal startup error.
+        print("[bigqmt_shell] previous rpc service stop failed: %s" % exc)
+
+
+_stop_previous_rpc_service()
 _clear_local_modules()
 _importlib.import_module = _local_import_module
 _importlib.reload = _local_reload
