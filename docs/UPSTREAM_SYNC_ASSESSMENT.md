@@ -6,6 +6,18 @@
 
 ---
 
+> ## ✅ 已执行（2026-08-18）
+>
+> 本评估的建议已落地：`upstream/main` (`fa480bd`, v0.2.1) 已合并进本仓库，合并 commit `c7023a9`。
+> - 冲突 **0 个**，与评估预测一致
+> - 合并后 `run_all_tests.py`：**298 passed / 4 skipped / 0 failed**
+> - 合并结果与 `upstream/main` 的差异**仅有本文件一个**（`git diff upstream/main HEAD` → 1 file changed）
+>
+> 下文保留同步前的评估原文。**第 5 节的 3 个风险项仍需在部署侧处理**（尤其 R1：国泰环境需设
+> `BIGQMT_LOG_ENABLED=0`），第 6 节的执行方案已完成，验收清单第 2–6 项仍待在实际 QMT 环境中核对。
+
+---
+
 ## 1. 结论摘要
 
 | 项目 | 结论 |
