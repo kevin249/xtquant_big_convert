@@ -145,6 +145,34 @@ class CapturingTradeGateway(DryRunOrderGateway):
         return []
 
 
+class LandingOrderGateway(DryRunOrderGateway):
+    """模拟 QMT：passorder 异步落地，委托号稍后出现在查询结果里。"""
+
+    def __init__(self, landed=True):
+        super().__init__()
+        self.landed = landed
+        self.orders = []
+
+    def submit(self, request):
+        result = super().submit(request)
+        if self.landed:
+            self.orders.append(
+                OrderSnapshot(
+                    order_sys_id="sysid-1",
+                    user_order_id=str(request.remark or ""),
+                    stock_code=request.stock_code,
+                    action=request.action,
+                    volume=request.volume,
+                    traded_volume=0,
+                    status="50",
+                )
+            )
+        return result
+
+    def query_orders(self, account_id, strategy_name):
+        return list(self.orders)
+
+
 class CapturingExecutionGateway(CapturingTradeGateway):
     def __init__(self):
         super().__init__()
@@ -248,6 +276,40 @@ class RedisRpcTest(unittest.TestCase):
         self.assertTrue(all(item["accepted"] for item in results))
         self.assertTrue(all(item["user_order_id"] for item in results))
         self.assertTrue(all(not item["order_sys_id"] for item in results))
+
+    def test_submit_order_enriches_order_sys_id_by_remark(self):
+        # issue #38: passorder 提交成功但委托号异步分配。服务端必须按唯一
+        # user_order_id(remark) 匹配并回填 order_sys_id，客户端才不会把
+        # 「已提交」误判成 -1 失败。
+        gateway = LandingOrderGateway(landed=True)
+        handlers = BigQmtRpcHandlers(
+            account_id="acct", market_data=FakeMarketData(),
+            position_provider=FakePositionProvider(), order_gateway=gateway,
+            allow_order_methods=True,
+        )
+        result = handlers.handle("order_stock", {
+            "account_id": "acct", "stock_code": "600000.SH", "order_type": 23,
+            "order_volume": 100, "price_type": 11, "price": 10.0,
+            "order_remark": "REMARK-38",
+        })
+        self.assertEqual(result.order_sys_id, "sysid-1")
+        self.assertEqual(handlers._last_server_error, "")
+
+    def test_submit_order_silent_rejection_sets_server_error(self):
+        # 委托没进系统（静默拒绝）时记录 server_error，客户端据此收到真实原因。
+        gateway = LandingOrderGateway(landed=False)
+        handlers = BigQmtRpcHandlers(
+            account_id="acct", market_data=FakeMarketData(),
+            position_provider=FakePositionProvider(), order_gateway=gateway,
+            allow_order_methods=True,
+        )
+        result = handlers.handle("order_stock", {
+            "account_id": "acct", "stock_code": "600000.SH", "order_type": 23,
+            "order_volume": 100, "price_type": 11, "price": 10.0,
+            "order_remark": "REMARK-38",
+        })
+        self.assertIsNone(result.order_sys_id)
+        self.assertIn("not found in system", handlers._last_server_error)
 
     def test_submit_orders_batch_reuses_order_tag_without_resubmitting(self):
         gateway = CountingOrderGateway()
@@ -433,6 +495,8 @@ class RedisRpcTest(unittest.TestCase):
         self.assertTrue(response["ok"], response["error"])
 
     def test_process_in_listener_wildcard_only_handles_ping_inline(self):
+        # get_full_tick is a market-data read (thread-safe in embedded terminal),
+        # so it stays inline for low latency and responds immediately.
         redis_client, service = _service_with_listener_methods(
             allow_order_methods=True,
             process_in_listener=True,
@@ -448,8 +512,7 @@ class RedisRpcTest(unittest.TestCase):
             }
         )
 
-        self.assertNotIn("bigqmt:rpc:resp:acct:direct-tick", redis_client.kv)
-        self.assertEqual(service.drain_pending(), 1)
+        # Inline: response written immediately, no pending drain needed.
         response = json.loads(redis_client.kv["bigqmt:rpc:resp:acct:direct-tick"])
         self.assertTrue(response["ok"], response["error"])
         self.assertEqual(response["data"]["600000.SH"]["lastPrice"], 10.5)
@@ -726,6 +789,75 @@ class RedisRpcTest(unittest.TestCase):
         self.assertTrue(response["ok"], response["error"])
         self.assertEqual(response["data"]["params"]["field_list"], ["close"])
         self.assertEqual(response["data"]["data"]["600000.SH"]["close"], [10.0])
+
+
+class DownloadHistoryDataTest(unittest.TestCase):
+    """Issue #32: download_history_data was routing to ContextInfo (which has
+    no such method) instead of the QMT-injected global function."""
+
+    def _handlers_with_qmt_global(self, func_name, func):
+        return BigQmtRpcHandlers(
+            account_id="acct",
+            market_data=FakeMarketData(),
+            position_provider=FakePositionProvider(),
+            qmt_api={func_name: func},
+        )
+
+    def test_download_history_data_calls_qmt_global(self):
+        calls = []
+
+        def fake_download(stock_code, period, start_time, end_time):
+            calls.append((stock_code, period, start_time, end_time))
+            return True
+
+        handlers = self._handlers_with_qmt_global("download_history_data", fake_download)
+        result = handlers.handle("download_history_data", {
+            "stock_code": "000001.SZ",
+            "period": "1d",
+            "start_time": "20230101",
+            "end_time": "",
+        })
+
+        self.assertEqual(calls, [("000001.SZ", "1d", "20230101", "")])
+        self.assertTrue(result)
+
+    def test_download_history_data2_calls_qmt_global(self):
+        calls = []
+
+        def fake_download2(stock_list, period, start_time, end_time):
+            calls.append((stock_list, period, start_time, end_time))
+            return True
+
+        handlers = self._handlers_with_qmt_global("download_history_data2", fake_download2)
+        result = handlers.handle("download_history_data2", {
+            "stock_list": ["000001.SZ", "600000.SH"],
+            "period": "1d",
+            "start_time": "20230101",
+            "end_time": "",
+        })
+
+        self.assertEqual(calls[0][0], ["000001.SZ", "600000.SH"])
+        self.assertEqual(calls[0][1], "1d")
+        self.assertTrue(result)
+
+    def test_download_history_data_fallback_to_adapter_when_no_global(self):
+        """When qmt_api has no download_history_data (e.g. outside QMT),
+        the handler falls back to the adapter path. With a FakeMarketData
+        that lacks the method, the handler returns False (graceful, not crash)."""
+        handlers = BigQmtRpcHandlers(
+            account_id="acct",
+            market_data=FakeMarketData(),
+            position_provider=FakePositionProvider(),
+            qmt_api={},
+        )
+        result = handlers.handle("download_history_data", {
+            "stock_code": "000001.SZ",
+            "period": "1d",
+            "start_time": "20230101",
+            "end_time": "",
+        })
+        # No global func and adapter lacks the method → returns False, not crash.
+        self.assertFalse(result)
 
 
 if __name__ == "__main__":

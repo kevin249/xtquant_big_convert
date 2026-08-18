@@ -29,10 +29,13 @@ _ORIGINAL_RELOAD = _importlib.reload
 
 
 def _known_qmt_python_dir():
-    install = "".join(chr(value) for value in (
-        0x541b, 0x5f18, 0x541b, 0x667a, 0x4ea4, 0x6613, 0x7cfb, 0x7edf,
-    ))
-    return r"D:\君弘君智交易系统\python"
+    # Find the QMT python dir from sys.path instead of a hardcoded path, so
+    # the bridge loads regardless of broker install location or launch mode
+    # (editor / paste-run / exec). Falls back to empty when not found.
+    for p in sys.path:
+        if p and r"\python" in p and os.path.isdir(p):
+            return p
+    return ""
 
 
 try:
@@ -62,12 +65,19 @@ def _resolve_name(name, module_globals, level):
 
 def _find_local_source(name):
     relative = name.replace(".", os.sep)
-    package_init = os.path.join(_SOURCE_ROOT, relative, "__init__.py")
-    if os.path.isfile(package_init):
-        return package_init, True
-    module_file = os.path.join(_SOURCE_ROOT, relative + ".py")
-    if os.path.isfile(module_file):
-        return module_file, False
+    dirs = []
+    if _SOURCE_ROOT:
+        dirs.append(_SOURCE_ROOT)
+    for p in sys.path:
+        if p and os.path.isdir(p) and p not in dirs:
+            dirs.append(p)
+    for d in dirs:
+        package_init = os.path.join(d, relative, "__init__.py")
+        if os.path.isfile(package_init):
+            return package_init, True
+        module_file = os.path.join(d, relative + ".py")
+        if os.path.isfile(module_file):
+            return module_file, False
     raise ModuleNotFoundError("local source not found: %s" % name, name=name)
 
 
@@ -134,16 +144,14 @@ def _local_import_module(name, package=None):
 
 def _local_reload(module):
     if _is_local_module(getattr(module, "__name__", "")):
-        # The shell clears these modules for every strategy start.  Do not hand
-        # their names back to QMT's normal import/reload allowlist afterwards.
-        return module
+        return _load_local_module(module.__name__)
     return _ORIGINAL_RELOAD(module)
 
 
 def _clear_local_modules():
-    names = [name for name in sys.modules if _is_local_module(name)]
-    for name in sorted(names, key=lambda item: item.count("."), reverse=True):
-        sys.modules.pop(name, None)
+    for name in list(sys.modules):
+        if _is_local_module(name):
+            sys.modules.pop(name, None)
 
 
 def _stop_previous_rpc_service():
@@ -224,13 +232,15 @@ try:
         "get_enable_short_contract", "get_unclosed_compacts", "get_closed_compacts",
         "get_debt_contract", "get_option_subject_position", "get_comb_option",
         "get_hkt_exchange_rate",
+        "download_history_data", "download_history_data2",
     ):
         if function_name in globals():
             qmt_extra[function_name] = globals()[function_name]
+    print("[bigqmt_shell] down_history_data bound=%s" % ("down_history_data" in qmt_extra))
     _runtime.bind_runtime_api(
-        passorder_func=passorder,
-        cancel_func=cancel,
-        get_trade_detail_data_func=get_trade_detail_data,
+        passorder_func=globals().get("passorder"),
+        cancel_func=globals().get("cancel"),
+        get_trade_detail_data_func=globals().get("get_trade_detail_data"),
         extra_funcs=qmt_extra or None,
     )
 except NameError:
