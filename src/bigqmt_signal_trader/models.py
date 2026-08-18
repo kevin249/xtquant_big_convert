@@ -162,19 +162,54 @@ class TradeSignal:
 
 
 class PositionSnapshot:
-    def __init__(self, stock_code, volume, available, cost=0.0, stock_name=""):
+    def __init__(
+        self,
+        stock_code,
+        volume,
+        available,
+        cost=0.0,
+        stock_name="",
+        market_value=None,
+        price=None,
+        open_price=None,
+        frozen_volume=0,
+        on_road_volume=0,
+        yesterday_volume=None,
+        direction=48,
+    ):
         self.stock_code = stock_code
         self.volume = volume
         self.available = available
         self.cost = cost
         self.stock_name = stock_name
+        self.market_value = market_value
+        self.price = price
+        self.open_price = open_price
+        self.frozen_volume = frozen_volume
+        self.on_road_volume = on_road_volume
+        self.yesterday_volume = yesterday_volume
+        self.direction = direction
 
 
 class AssetSnapshot:
-    def __init__(self, account_id, cash=None, total_asset=None):
+    """Account funds, mirroring MiniQMT's ``XtAsset``.
+
+    Field names follow ``xtquant.xttype.XtAsset(account_id, cash, frozen_cash,
+    market_value, total_asset)`` so ``query_stock_asset`` can hand callers the
+    same attributes they get from MiniQMT.
+
+    ``cash`` is 可用 (available), NOT the full 资金余额:
+    ``total_asset == cash + frozen_cash + market_value``. New fields are
+    appended with None defaults so existing positional callers keep working,
+    and None means "the terminal did not report it" — distinct from 0.0.
+    """
+
+    def __init__(self, account_id, cash=None, total_asset=None, frozen_cash=None, market_value=None):
         self.account_id = account_id
         self.cash = cash
         self.total_asset = total_asset
+        self.frozen_cash = frozen_cash
+        self.market_value = market_value
 
 
 class AccountSnapshot:
